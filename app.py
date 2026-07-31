@@ -162,6 +162,35 @@ def verify_node_continuity(Q, node_demands):
     return net  # should all be ~0
 
 
+def auto_balance_Q0(node_demands, chord3_frac=0.4, chord6_frac=0.10):
+    """
+    Given arbitrary node demands, automatically compute a set of initial pipe
+    flows (Q0) that satisfies continuity at every node — so the user never
+    has to hand-adjust Q0 after changing demands.
+
+    Method: treat pipes {1,2,4,5} as a spanning tree of the network and
+    pipes {3,6} as the two "chord" pipes that close loops I and II. Chord
+    flows are assigned as a fraction of total network inflow (a sensible,
+    always-feasible starting guess); tree-pipe flows are then solved
+    directly from node continuity equations (this network's fixed topology
+    makes this a simple closed-form back-substitution — no iteration needed).
+    Hardy Cross will converge to the same final answer regardless of this
+    starting guess.
+    """
+    d = node_demands
+    total_in = sum(v for v in d.values() if v > 0) or 1.0
+
+    Q3 = chord3_frac * total_in   # chord pipe a-c
+    Q6 = chord6_frac * total_in   # chord pipe c-e
+
+    Q1 = d["a"] - Q3                    # pipe a-b
+    Q5 = -d["e"] - Q6                   # pipe d-e
+    Q2 = Q6 - d["c"] - Q3                # pipe b-c
+    Q4 = Q5 - d["d"]                    # pipe b-d
+
+    return {1: Q1, 2: Q2, 3: Q3, 4: Q4, 5: Q5, 6: Q6}
+
+
 # ----------------------------------------------------------------------
 # ---------------------------  DIAGRAM  ----------------------------------
 # ----------------------------------------------------------------------
@@ -218,8 +247,8 @@ with st.sidebar:
     tol = st.number_input("Convergence tolerance (cfs)", value=0.0001, format="%.5f")
     st.markdown("---")
     st.markdown(
-        "**Note:** Edit pipe data (f, L, D, initial flow) in the table below. "
-        "Initial flows must satisfy continuity at every node — the app checks this for you."
+        "**Note:** When auto-balance is ON, initial flows (Q0) are calculated for you "
+        "every time node demands change, so continuity is always satisfied automatically."
     )
 
 st.subheader("1️⃣ Node Demands (editable)")
@@ -241,15 +270,42 @@ else:
     st.success("✅ Node demands are balanced (sum = 0).")
 
 st.subheader("2️⃣ Pipe Data (editable)")
+
+auto_balance = st.checkbox(
+    "🔄 Auto-calculate initial flows (Q0) from node demands (recommended)",
+    value=True,
+    help="When ON, Q0 is recalculated automatically every time you change node demands above, "
+         "so continuity is always satisfied — no manual adjustment needed. Turn OFF only if "
+         "you want to type in your own custom initial guess (e.g. to match a manual hand "
+         "calculation exactly)."
+)
+
+pipes_input = DEFAULT_PIPES.copy()
+if auto_balance:
+    auto_Q0 = auto_balance_Q0(node_demands)
+    pipes_input["Q0_cfs"] = pipes_input["Pipe"].map(auto_Q0)
+
+# The data_editor's widget state is cached by its `key`. If the key stays
+# fixed, Streamlit will keep showing whatever the user last saw/edited even
+# after auto_Q0 changes underneath it. So the key must change whenever the
+# node demands (and therefore auto_Q0) change — this forces a fresh editor
+# instance to load with the newly computed Q0 values.
+demand_key = "_".join(f"{v:.3f}" for v in node_demands.values())
+editor_key = f"pipes_editor_auto_{demand_key}" if auto_balance else "pipes_editor_manual"
+
 pipes_df = st.data_editor(
-    DEFAULT_PIPES, num_rows="fixed", use_container_width=True,
+    pipes_input, num_rows="fixed", use_container_width=True,
+    key=editor_key,
     column_config={
         "Pipe": st.column_config.NumberColumn(disabled=True),
         "From": st.column_config.TextColumn(disabled=True),
         "To": st.column_config.TextColumn(disabled=True),
         "Loop": st.column_config.TextColumn(disabled=True),
         "f": st.column_config.NumberColumn(format="%.4f"),
-        "Q0_cfs": st.column_config.NumberColumn(help="Initial assumed flow (cfs), + = From→To direction"),
+        "Q0_cfs": st.column_config.NumberColumn(
+            help="Initial assumed flow (cfs), + = From→To direction",
+            disabled=auto_balance,
+        ),
     },
 )
 
@@ -260,8 +316,13 @@ bad_nodes = {n: v for n, v in node_check.items() if abs(v) > 1e-6}
 if abs(demand_sum) > 1e-6:
     bad_nodes = {**bad_nodes, "_demand_sum_error": demand_sum}
 if bad_nodes:
-    st.error(f"⚠️ Initial flows do NOT satisfy continuity at node(s): {bad_nodes}. "
-             f"Adjust Q0_cfs values above (positive = From→To).")
+    if auto_balance:
+        st.error(f"⚠️ Auto-balance could not satisfy continuity at node(s): {bad_nodes}. "
+                 f"This usually means the demands are unbalanced (see the sum check above) — "
+                 f"fix the node demand values.")
+    else:
+        st.error(f"⚠️ Initial flows do NOT satisfy continuity at node(s): {bad_nodes}. "
+                 f"Adjust Q0_cfs values above (positive = From→To), or turn on auto-balance.")
 else:
     st.success("✅ Initial flows satisfy continuity at every node.")
 
