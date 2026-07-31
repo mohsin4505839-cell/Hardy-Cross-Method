@@ -150,13 +150,14 @@ def hardy_cross_solve(pipes_df, formula, n_exp=2, max_iter=15, tol=1e-4):
     return results, iteration_log, converged
 
 
-def verify_node_continuity(Q):
-    """Check inflow=outflow at every node given final pipe flows Q (dict pipe->cfs)."""
+def verify_node_continuity(Q, node_demands):
+    """Check inflow=outflow at every node given final pipe flows Q (dict pipe->cfs)
+    and the node demands (dict node -> +inflow/-outflow, cfs)."""
     net = {n: 0.0 for n in NODE_POS}
     for pipe_id, (frm, to) in PIPE_ENDPOINTS.items():
         net[frm] -= Q[pipe_id]
         net[to] += Q[pipe_id]
-    for node, demand in DEFAULT_NODE_DEMANDS.items():
+    for node, demand in node_demands.items():
         net[node] += demand
     return net  # should all be ~0
 
@@ -164,7 +165,7 @@ def verify_node_continuity(Q):
 # ----------------------------------------------------------------------
 # ---------------------------  DIAGRAM  ----------------------------------
 # ----------------------------------------------------------------------
-def draw_network(Q, title="Pipe Network"):
+def draw_network(Q, node_demands, title="Pipe Network"):
     fig, ax = plt.subplots(figsize=(6, 4))
     for pipe_id, (frm, to) in PIPE_ENDPOINTS.items():
         x1, y1 = NODE_POS[frm]
@@ -185,10 +186,12 @@ def draw_network(Q, title="Pipe Network"):
         ax.plot(x, y, "ko", markersize=8)
         ax.text(x - 0.15, y - 0.22, node, fontsize=12, fontweight="bold")
 
-    demand_text = {"a": "100 cfs IN", "b": "25 cfs OUT", "c": "50 cfs OUT", "e": "25 cfs OUT"}
-    for node, txt in demand_text.items():
+    for node, demand in node_demands.items():
+        if abs(demand) < 1e-9:
+            continue
         x, y = NODE_POS[node]
-        ax.text(x, y + 0.3 if node != "c" else y - 0.35, txt, fontsize=8, color="green", ha="center")
+        label = f"{demand:.1f} cfs IN" if demand > 0 else f"{abs(demand):.1f} cfs OUT"
+        ax.text(x, y + 0.3 if node != "c" else y - 0.35, label, fontsize=8, color="green", ha="center")
 
     ax.set_title(title, fontsize=11)
     ax.set_xlim(-1, 5)
@@ -219,7 +222,25 @@ with st.sidebar:
         "Initial flows must satisfy continuity at every node — the app checks this for you."
     )
 
-st.subheader("1️⃣ Pipe Data (editable)")
+st.subheader("1️⃣ Node Demands (editable)")
+st.caption("Positive = water entering the network at that node, Negative = water leaving "
+           "(demand/outflow). Total must sum to 0 for the network to balance.")
+demand_cols = st.columns(len(NODE_POS))
+node_demands = {}
+for col, node in zip(demand_cols, NODE_POS.keys()):
+    with col:
+        node_demands[node] = st.number_input(
+            f"Node {node} (cfs)", value=float(DEFAULT_NODE_DEMANDS[node]), step=5.0, key=f"demand_{node}"
+        )
+
+demand_sum = sum(node_demands.values())
+if abs(demand_sum) > 1e-6:
+    st.error(f"⚠️ Node demands do not sum to zero (sum = {demand_sum:.3f} cfs). "
+             f"Total inflow must equal total outflow for the network — fix the values above.")
+else:
+    st.success("✅ Node demands are balanced (sum = 0).")
+
+st.subheader("2️⃣ Pipe Data (editable)")
 pipes_df = st.data_editor(
     DEFAULT_PIPES, num_rows="fixed", use_container_width=True,
     column_config={
@@ -234,8 +255,10 @@ pipes_df = st.data_editor(
 
 # continuity check on initial assumption
 Q0 = {int(r["Pipe"]): float(r["Q0_cfs"]) for _, r in pipes_df.iterrows()}
-node_check = verify_node_continuity(Q0)
+node_check = verify_node_continuity(Q0, node_demands)
 bad_nodes = {n: v for n, v in node_check.items() if abs(v) > 1e-6}
+if abs(demand_sum) > 1e-6:
+    bad_nodes = {**bad_nodes, "_demand_sum_error": demand_sum}
 if bad_nodes:
     st.error(f"⚠️ Initial flows do NOT satisfy continuity at node(s): {bad_nodes}. "
              f"Adjust Q0_cfs values above (positive = From→To).")
@@ -249,7 +272,7 @@ if run:
         pipes_df, formula, n_exp=n_exp, max_iter=max_iter, tol=tol
     )
 
-    st.subheader("2️⃣ Iteration-by-Iteration Results")
+    st.subheader("3️⃣ Iteration-by-Iteration Results")
     if converged:
         st.success(f"Converged in {len(iteration_log)} iterations (tolerance = {tol} cfs).")
     else:
@@ -269,11 +292,11 @@ if run:
                 })
                 st.dataframe(tbl.sort_values("Pipe"), use_container_width=True, hide_index=True)
             with col2:
-                fig = draw_network(entry["Q_after"], title=f"Network after Iteration {it}")
+                fig = draw_network(entry["Q_after"], node_demands, title=f"Network after Iteration {it}")
                 st.pyplot(fig, use_container_width=True)
                 plt.close(fig)
 
-    st.subheader("3️⃣ Final Results")
+    st.subheader("4️⃣ Final Results")
     st.dataframe(
         results.style.format({
             "f": "{:.4f}", "K": "{:.6f}", "Q_final_cfs": "{:.3f}",
@@ -283,17 +306,17 @@ if run:
     )
 
     final_Q = {int(r["Pipe"]): r["Q_final_cfs"] for _, r in results.iterrows()}
-    final_check = verify_node_continuity(final_Q)
+    final_check = verify_node_continuity(final_Q, node_demands)
     st.caption(f"Node continuity residuals (should be ≈ 0): "
                f"{ {k: round(v,5) for k,v in final_check.items()} }")
 
-    st.subheader("4️⃣ Final Network Diagram")
-    fig_final = draw_network(final_Q, title="Final Converged Flow Distribution")
+    st.subheader("5️⃣ Final Network Diagram")
+    fig_final = draw_network(final_Q, node_demands, title="Final Converged Flow Distribution")
     st.pyplot(fig_final, use_container_width=True)
     plt.close(fig_final)
 
     # ---- downloads ----
-    st.subheader("5️⃣ Export")
+    st.subheader("6️⃣ Export")
     csv_buf = io.StringIO()
     results.to_csv(csv_buf, index=False)
     st.download_button("⬇ Download Final Results (CSV)", csv_buf.getvalue(),
